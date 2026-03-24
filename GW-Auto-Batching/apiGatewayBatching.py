@@ -19,6 +19,7 @@ import asyncio
 import time
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 import httpx
 
@@ -38,7 +39,7 @@ async def batch_worker():
     global last_process_time
     
     while True:
-        await asyncio.sleep(0.01)  # verificar a cada 10ms
+        await asyncio.sleep(0.01)
 
         async with lock:
             if not queue:
@@ -47,15 +48,17 @@ async def batch_worker():
             current_time = time.time()
             elapsed_time = current_time - last_process_time
             
-            # Processar se atingiu BATCH_SIZE OU passou TIME_WINDOW
             if len(queue) >= BATCH_SIZE or elapsed_time >= TIME_WINDOW:
+                print(f"📦 Processando batch de {len(queue)} requests")  # DEBUG
                 batch = queue.copy()
                 queue.clear()
                 last_process_time = current_time
             else:
                 continue
 
-        async with httpx.AsyncClient() as client:
+        # Timeout de 300 segundos para chamadas ao vLLM
+        timeout = httpx.Timeout(300.0, connect=10.0)
+        async with httpx.AsyncClient(timeout=timeout) as client:
             tasks = []
 
             for item in batch:
@@ -68,10 +71,22 @@ async def batch_worker():
 
                 tasks.append(client.post(VLLM_URL, json=payload))
 
-            responses = await asyncio.gather(*tasks)
-
-            for item, resp in zip(batch, responses):
-                item["future"].set_result(resp.json())
+            try:
+                responses = await asyncio.gather(*tasks)
+                print(f"✅ Respostas recebidas: {len(responses)}")  # DEBUG
+                
+                for item, resp in zip(batch, responses):
+                    if resp.status_code == 200:
+                        item["future"].set_result(resp.json())
+                    else:
+                        error_msg = f"vLLM error {resp.status_code}: {resp.text[:500]}"
+                        print(f"❌ {error_msg}")
+                        item["future"].set_exception(Exception(error_msg))
+            except Exception as e:
+                print(f"❌ Erro ao chamar vLLM: {e}")  # DEBUG
+                for item in batch:
+                    if not item["future"].done():
+                        item["future"].set_exception(e)
 
 # Lifespan context manager (substituindo on_event)
 @asynccontextmanager
@@ -96,7 +111,13 @@ async def chat(req: Request):
             "future": future
         })
 
-    return await future
+    try:
+        result = await asyncio.wait_for(future, timeout=300)
+        return result
+    except asyncio.TimeoutError:
+        return JSONResponse(status_code=504, content={"error": "Timeout na processamento"})
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": f"Erro interno no gateway: {str(e)}"})
 
 if __name__ == "__main__":
     import uvicorn
